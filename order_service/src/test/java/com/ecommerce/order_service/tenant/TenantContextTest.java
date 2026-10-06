@@ -1,4 +1,4 @@
-package com.ecommerce.notification_service.tenant;
+package com.ecommerce.order_service.tenant;
 
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
