@@ -1,20 +1,63 @@
 # E-Commerce Microservices Assessment
 
-Two Spring Boot services for a multi-tenant e-commerce platform:
+## Architecture & Design
 
-- **order-service** - creates and manages the lifecycle of orders
-- **notification-service** - records notifications triggered by order events
-
----
-
-## System Overview
+### System Design
 
 - **order-service** owns the order lifecycle and maintains system of record for orders.
-- When an order is created, updated, or cancelled, order-service publishes an internal domain event. After the database transaction commits, a listener calls notification-service over REST, forwarding the tenant context.
-- **notification-service** simulates sending a notification and keeps an audit record in a ddb. This reacts to order events.
-- Both services share one PostgreSQL instance (separate tables).
+- **notification-service** consumes the order events and keeps an audit record in PostgreSQL of what was notified.
+- These 2 services communicate over REST, but the notification call is decoupled from the order transaction. When an order is created, updated, or cancelled, order-service publishes an internal domain event. After the database transaction commits, a listener calls notification-service over REST, forwarding the tenant context.
 
 Since this system includes only two services I decided to implement REST, which keeps the system simple to run and operate. The notification call is deliberately decoupled from the order transaction so order persistence never depends on notification-service being available. If this grew beyond two services or needed guaranteed fan-out, I would implement an event broker. The current design keeps that migration path available by already modeling order changes as events.
+
+### Multi-Tenancy Design
+
+- Tenancy is enforced consistently throughout the service.
+
+- Tenant header,`X-Tenant-ID`, is mandatory and validated in the TenantInterceptor before any business logic runs and is rejected with a 400 Bad Request error. This way the service will never process code for any unknown client.
+- Between services, when the order service calls the notification service, it forwards the `X-Tenant-ID` header. This passes the tenant identity along so isolation is preserved.
+- Every GET operation is tenant-scoped (`findByIdAndTenantId`, `findByTenantId`) and `tenant_id` is non null and indexed on every table. Since queries are tenant scoped, this leads to less data leaking and since it must be non null, no row can exist without a tenant.
+
+### Tenant Context Propagation
+
+- The tenant context flows inbound through the request carrying the `X-Tenant-ID` header.
+- A TenantInterceptor runs before the controllers which validates the header and puts it in a TenantContext, which is backed by a ThreadLocal and cleared afterCompletion. This way a pooled thread never carries one requests tenant into the next.
+- The service and the data layers read the tenant from the TenantContext.
+- When order service calls notification service, the tenant is published on the event and sent to the notification service's TenantInterceptor.
+
+### Resilience and failure handling
+
+This system is designed in such a way to prioritize that **an order write must never fail because of notification-service**, and no event may be silently lost.
+
+- Notifications are sent on a transaction-synchronized hook (`@TransactionalEventListener(AFTER_COMMIT)`) that fires only after the order commits. If the order transaction fails, no notification is sent.
+- The HTTP client has explicit connect and read timeouts, so a slow or hung notification-service cannot exhaust caller threads.
+- If notification-service is down or returns an error, the attempt is recorded in a `failed_notifications` table rather than swallowed in a log line. That makes the failure reconcilable, or atleast adds observability.
+
+### Industry Standards Applied
+
+- Each service has a single responsibility. The order service manages orders and the notification service manages notifications.
+- Each service never reads or writes into/from another service's table. Even though there is 1 postgres instance, each service has its own seperate tables and no cross access.
+- Domain events and transactional event listener decouples the notification from saving the order
+- State machine for order lifecycle means there is an explicit path for the status to follow and invalid updates return conflicts.
+- DTO (data transfer object) are created to keep the API contract seperate from the internal data model.
+
+## Production Readiness
+
+- In the docker compose, I would add health checks and gate the app startup on dependency readiness for reliable cold starts.
+- For the notification delivery, I would implement a message broker such as SNS/SQS. The order service would publish messages to a SNS topic and the notification service would consume from the SQS queue subscribed to it. I would also implement a DLQ which would catch failed messages with a redrive policy.
+- I would add more observability such as metrics and alarms on the number of messages in the DLQ and delivery success/failure rate.
+- I would add idempotency. SNS and SQS delivers at least once so there may be duplicates, so I would ensure that there is unique key (tenant_id, order_id, event_type, or another unique id) so that if a message delivers twice it does not notify the customer again.
+- When retrying after a transient failure, it would be retried via SQS visibility timeout backoff using exponential intervals with jitter. After the retries are exhausted, it would go to the DLQ.
+
+## Assumptions
+
+- Notifications have eventual consistency and may be delivered slightly after the order responds. It is assumed that the delivery time does not need to be immedediate.
+- Assuming that the order does not matter for the notifications sent from the order service.
+- There is a single shared PostgreSQL instance with a table per service, representing the logical database per service boundary without the operational cost of two databases for the assessment.
+- IDs are server generated UUIDs.
+- Tenant identity is provided by a trusted upstream (API gateway / auth layer) via `X-Tenant-ID`. Authentication is out of scope for this assessment.
+- Order fields are intentionally minimal, `customerEmail` and `totalAmount`. In production, there would likely be additional fields such as quantities, currency, addresses, and payment. These are all are out of scope.
+- Notifications are simulated (structured log + persisted audit record), with `simulation_status` always `SIMULATED_SENT` today, which is modeled as the extension point for real delivery states (sent/failed/bounced).
 
 ---
 
@@ -31,19 +74,11 @@ The following statuses are implemented to represent different stages of an order
 
 Illegal updates (updating an already cancelled order or cancelling an already completed order) are rejected with `409 Conflict` error. An order already processing can also not be updated to pending. Each change emits an event type: `ORDER_CREATED`, `ORDER_UPDATED`, `ORDER_COMPLETED`, `ORDER_CANCELLED`.
 
-### Resilience and failure handling
-
-This system is designed in such a way to prioritize that **an order write must never fail because of notification-service**, and no event may be silently lost.
-
-- Notifications are sent on a transaction-synchronized hook (`@TransactionalEventListener(AFTER_COMMIT)`) that fires only after the order commits. If the order transaction fails, no notification is sent.
-- The HTTP client has explicit connect and read timeouts, so a slow or hung notification-service cannot exhaust caller threads.
-- If notification-service is down or returns an error, the attempt is recorded in a `failed_notifications` table rather than swallowed in a log line. That makes the failure reconcilable, or atleast adds observability.
-
 ---
 
 ## Running the System
 
-Both images are published to Docker Hub and referenced from `docker-compose.yaml`:
+Both images are published to Docker Hub and referenced from `docker-compose.yml`:
 
 ```bash
 docker compose up
@@ -95,7 +130,7 @@ curl -X 'POST' \
 }'
 ```
 
-Update status (returns `409` on an illegal transition):
+Update status:
 
 ```bash
 curl -X 'PUT' \
@@ -138,25 +173,3 @@ curl -X 'POST' \
 **failed_notifications**: `id` (UUID), `tenant_id`, `order_id`, `event_type`, `customer_email`, `amount`, `failure_reason`, `failed_at`. Maintains record of undelivered notifications for reconciliation.
 
 ---
-
-## Assumptions
-
-- **Tenant identity** is provided by a trusted upstream (API gateway / auth layer) via `X-Tenant-ID`. Authentication is out of scope for this assessment.
-- **Order fields** are intentionally minimal - `customerEmail` and `totalAmount` - which is enough to demonstrate lifecycle and tenancy. In production, there would likely be additional fields such as quantities, currency, addresses, and payment. These are all are out of scope.
-- **CreateOrder Validation:** `customerEmail` must be a syntactically valid email; `totalAmount` must be greater than zero (an order with no value is invalid). Amounts use `BigDecimal`.
-- **Order Lifecycle:** `PENDING -> PROCESSING -> COMPLETED`, with `CANCELLED` reachable from any non-terminal state (not `COMPLETED` or `CANCELLED`). Cancelling these will return a client error (`409`).
-- **Notifications are simulated** (structured log + persisted audit record), with `simulation_status` always `SIMULATED_SENT` today - modeled as the extension point for real delivery states (sent/failed/bounced).
-- **Notification delivery is best-effort-but-recorded:** a failed send does not fail the order. It is maintained for reconciliation. Notifications may therefore be delivered slightly after the order responds (eventual consistency).
-- **Single shared PostgreSQL instance** with a table per service, representing the logical DB-per-service boundary without the operational cost of two databases for the assessment.
-- **IDs are server-generated UUIDs**, unique tenant identifier.
-- Assuming that the order does not matter for the notifications sent from the order service.
-
----
-
-## Production Readiness
-
-- In the docker compose, I would add health checks and gate the app startup on dependency readiness for reliable cold starts.
-- For the notification delivery, I would implement a message broker such as SNS/SQS. The order service would publish messages to a SNS topic and the notification service would consume from the SQS queue subscribed to it. I would also implement a DLQ which would catch failed messages with a redrive policy.
-- I would add more observability such as metrics and alarms on the number of messages in the DLQ and delivery success/failure rate.
-- I would add idempotency. SNS and SQS delivers at least once so there may be duplicates, so I would ensure that there is unique key (tenant_id, order_id, event_type, or another unique id) so that if a message delivers twice it does not notify the customer again.
-- When retrying after a transient failure, it would be retried via SQS visibility timeout backoff using exponential intervals with jitter. After the retries are exhausted, it would go to the DLQ.
