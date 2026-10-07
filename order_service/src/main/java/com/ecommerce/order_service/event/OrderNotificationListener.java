@@ -1,8 +1,6 @@
 package com.ecommerce.order_service.event;
 
 import com.ecommerce.order_service.client.NotificationRestClient;
-import com.ecommerce.order_service.model.FailedNotification;
-import com.ecommerce.order_service.repository.FailedNotificationRepository;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
@@ -18,7 +16,7 @@ import org.springframework.transaction.event.TransactionalEventListener;
 public class OrderNotificationListener {
 
     private final NotificationRestClient notificationClient;
-    private final FailedNotificationRepository failedNotificationRepository;
+    private final FailedNotificationRecorder failedNotificationRecorder;
 
     @TransactionalEventListener(phase = TransactionPhase.AFTER_COMMIT)
     public void onOrderEvent(OrderEvent event) {
@@ -36,14 +34,7 @@ public class OrderNotificationListener {
 
     private void persistFailure(OrderEvent event, Exception ex) {
         try {
-            failedNotificationRepository.save(FailedNotification.builder()
-                    .tenantId(event.tenantId())
-                    .orderId(event.orderId())
-                    .eventType(event.eventType())
-                    .customerEmail(event.customerEmail())
-                    .amount(event.amount())
-                    .failureReason(truncate(ex.getMessage()))
-                    .build());
+            failedNotificationRecorder.record(event, truncate(ex.getMessage()));
         } catch (Exception persistEx) {
             log.error("Could not persist failed notification for order [{}]: {}",
                     event.orderId(), persistEx.getMessage());
