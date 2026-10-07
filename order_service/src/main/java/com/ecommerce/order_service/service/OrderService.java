@@ -1,14 +1,16 @@
 package com.ecommerce.order_service.service;
 
-import com.ecommerce.order_service.client.NotificationRestClient;
 import com.ecommerce.order_service.dto.OrderCreateRequest;
 import com.ecommerce.order_service.dto.OrderResponse;
+import com.ecommerce.order_service.event.OrderEvent;
+import com.ecommerce.order_service.exception.InvalidOrderStateException;
+import com.ecommerce.order_service.exception.OrderNotFoundException;
 import com.ecommerce.order_service.model.Order;
 import com.ecommerce.order_service.model.OrderStatus;
 import com.ecommerce.order_service.repository.OrderRepository;
 import com.ecommerce.order_service.tenant.TenantContext;
-import jakarta.persistence.EntityNotFoundException;
 import lombok.RequiredArgsConstructor;
+import org.springframework.context.ApplicationEventPublisher;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -21,7 +23,7 @@ import java.util.stream.Collectors;
 public class OrderService {
 
     private final OrderRepository orderRepository;
-    private final NotificationRestClient notificationClient;
+    private final ApplicationEventPublisher eventPublisher;
 
     @Transactional
     public OrderResponse createOrder(OrderCreateRequest request) {
@@ -36,9 +38,7 @@ public class OrderService {
 
         Order savedOrder = orderRepository.save(order);
 
-        // Trigger notification asynchronously or synchronously via client
-        notificationClient.sendNotification(savedOrder.getId(), "ORDER_CREATED", savedOrder.getCustomerEmail(),
-                savedOrder.getTotalAmount());
+        publishEvent(savedOrder, "ORDER_CREATED");
 
         return mapToResponse(savedOrder);
     }
@@ -48,14 +48,17 @@ public class OrderService {
         String tenantId = TenantContext.getTenantId();
 
         Order order = orderRepository.findByIdAndTenantId(orderId, tenantId)
-                .orElseThrow(() -> new EntityNotFoundException("Order not found with ID: " + orderId));
+                .orElseThrow(() -> new OrderNotFoundException(orderId));
+
+        if (!order.getStatus().canTransitionTo(newStatus)) {
+            throw new InvalidOrderStateException(
+                    "Cannot transition order %s from %s to %s".formatted(orderId, order.getStatus(), newStatus));
+        }
 
         order.setStatus(newStatus);
         Order updatedOrder = orderRepository.save(order);
 
-        String eventType = (newStatus == OrderStatus.COMPLETED) ? "ORDER_COMPLETED" : "ORDER_UPDATED";
-        notificationClient.sendNotification(updatedOrder.getId(), eventType, updatedOrder.getCustomerEmail(),
-                updatedOrder.getTotalAmount());
+        publishEvent(updatedOrder, eventTypeFor(newStatus));
 
         return mapToResponse(updatedOrder);
     }
@@ -65,17 +68,17 @@ public class OrderService {
         String tenantId = TenantContext.getTenantId();
 
         Order order = orderRepository.findByIdAndTenantId(orderId, tenantId)
-                .orElseThrow(() -> new EntityNotFoundException("Order not found with ID: " + orderId));
+                .orElseThrow(() -> new OrderNotFoundException(orderId));
 
-        if (order.getStatus() == OrderStatus.COMPLETED || order.getStatus() == OrderStatus.CANCELLED) {
-            throw new IllegalStateException("Cannot cancel an order that is already completed or cancelled.");
+        if (!order.getStatus().canTransitionTo(OrderStatus.CANCELLED)) {
+            throw new InvalidOrderStateException(
+                    "Cannot cancel order %s in status %s".formatted(orderId, order.getStatus()));
         }
 
         order.setStatus(OrderStatus.CANCELLED);
         Order cancelledOrder = orderRepository.save(order);
 
-        notificationClient.sendNotification(cancelledOrder.getId(), "ORDER_CANCELLED",
-                cancelledOrder.getCustomerEmail(), cancelledOrder.getTotalAmount());
+        publishEvent(cancelledOrder, "ORDER_CANCELLED");
 
         return mapToResponse(cancelledOrder);
     }
@@ -92,8 +95,25 @@ public class OrderService {
     public OrderResponse getOrderById(UUID orderId) {
         String tenantId = TenantContext.getTenantId();
         Order order = orderRepository.findByIdAndTenantId(orderId, tenantId)
-                .orElseThrow(() -> new EntityNotFoundException("Order not found with ID: " + orderId));
+                .orElseThrow(() -> new OrderNotFoundException(orderId));
         return mapToResponse(order);
+    }
+
+    private void publishEvent(Order order, String eventType) {
+        eventPublisher.publishEvent(new OrderEvent(
+                order.getId(),
+                order.getTenantId(),
+                eventType,
+                order.getCustomerEmail(),
+                order.getTotalAmount()));
+    }
+
+    private String eventTypeFor(OrderStatus status) {
+        return switch (status) {
+            case COMPLETED -> "ORDER_COMPLETED";
+            case CANCELLED -> "ORDER_CANCELLED";
+            default -> "ORDER_UPDATED";
+        };
     }
 
     private OrderResponse mapToResponse(Order order) {
